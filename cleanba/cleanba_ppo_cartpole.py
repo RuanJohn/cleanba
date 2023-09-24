@@ -8,16 +8,15 @@ from collections import deque
 from dataclasses import dataclass, field
 from functools import partial
 from types import SimpleNamespace
-from typing import List, NamedTuple, Optional, Sequence, Tuple
+from typing import List, NamedTuple, Optional, Sequence
 
-import envpool
 import flax
 import flax.linen as nn
+import gym
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import rlax
 import tyro
 from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
@@ -44,7 +43,7 @@ class Args:
     "seed of the experiment"
     track: bool = False
     "if toggled, this experiment will be tracked with Weights and Biases"
-    wandb_project_name: str = "cleanRL"
+    wandb_project_name: str = "ruan"
     "the wandb's project name"
     wandb_entity: str = None
     "the entity (team) of wandb's project"
@@ -60,13 +59,13 @@ class Args:
     "the logging frequency of the model performance (in terms of `updates`)"
 
     # Algorithm specific arguments
-    env_id: str = "Breakout-v5"
+    env_id: str = "CartPole-v1"
     "the id of the environment"
     total_timesteps: int = 50000000
     "total timesteps of the experiments"
     learning_rate: float = 2.5e-4
     "the learning rate of the optimizer"
-    local_num_envs: int = 64
+    local_num_envs: int = 4
     "the number of parallel game environments"
     num_actor_threads: int = 2
     "the number of actor threads to use"
@@ -128,19 +127,18 @@ ATARI_MAX_FRAMES = int(
 )  # 108000 is the max number of frames in an Atari game, divided by 4 to account for frame skipping
 
 
+def make_env_single(env_id):
+    def thunk():
+        env = gym.make(env_id)
+        return env
+
+    return thunk
+
+
 def make_env(env_id, seed, num_envs):
     def thunk():
-        envs = envpool.make(
-            env_id,
-            env_type="gym",
-            num_envs=num_envs,
-            episodic_life=False,  # Machado et al. 2017 (Revisitng ALE: Eval protocols) p. 6
-            repeat_action_probability=0.25,  # Machado et al. 2017 (Revisitng ALE: Eval protocols) p. 12
-            noop_max=1,  # Machado et al. 2017 (Revisitng ALE: Eval protocols) p. 12 (no-op is deprecated in favor of sticky action, right?)
-            full_action_space=True,  # Machado et al. 2017 (Revisitng ALE: Eval protocols) Tab. 5
-            max_episode_steps=ATARI_MAX_FRAMES,  # Hessel et al. 2018 (Rainbow DQN), Table 3, Max frames per episode
-            reward_clip=True,
-            seed=seed,
+        envs = gym.vector.SyncVectorEnv(
+            [make_env_single(env_id) for i in range(num_envs)]
         )
         envs.num_envs = num_envs
         envs.single_action_space = envs.action_space
@@ -176,18 +174,33 @@ class ConvSequence(nn.Module):
         return x
 
 
+# class Network(nn.Module):
+#     channels: Sequence[int] = (16, 32, 32)
+#     hiddens: Sequence[int] = (256,)
+
+#     @nn.compact
+#     def __call__(self, x):
+#         x = jnp.transpose(x, (0, 2, 3, 1))
+#         x = x / (255.0)
+#         for channels in self.channels:
+#             x = ConvSequence(channels)(x)
+#         x = nn.relu(x)
+#         x = x.reshape((x.shape[0], -1))
+#         for hidden in self.hiddens:
+#             x = nn.Dense(
+#                 hidden, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+#             )(x)
+#             x = nn.relu(x)
+#         return x
+
+
 class Network(nn.Module):
     channels: Sequence[int] = (16, 32, 32)
     hiddens: Sequence[int] = (256,)
 
     @nn.compact
     def __call__(self, x):
-        x = jnp.transpose(x, (0, 2, 3, 1))
-        x = x / (255.0)
-        for channels in self.channels:
-            x = ConvSequence(channels)(x)
-        x = nn.relu(x)
-        x = x.reshape((x.shape[0], -1))
+        # x = x.reshape((x.shape[0], -1))
         for hidden in self.hiddens:
             x = nn.Dense(
                 hidden, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
@@ -261,7 +274,7 @@ def rollout(
         hidden = Network(args.channels, args.hiddens).apply(
             params.network_params, next_obs
         )
-        logits = Actor(envs.single_action_space.n).apply(params.actor_params, hidden)
+        logits = Actor(envs.single_action_space[0].n).apply(params.actor_params, hidden)
         # sample action: Gumbel-softmax trick
         # see https://stats.stackexchange.com/questions/359442/sampling-from-a-categorical-distribution
         key, subkey = jax.random.split(key)
@@ -339,6 +352,7 @@ def rollout(
 
             env_send_time_start = time.time()
             next_obs, next_reward, next_done, info = envs.step(cpu_action)
+            # TODO (Ruan): Check what envpool puts in info and make suitable wrapper.
             env_id = info["env_id"]
             env_send_time += time.time() - env_send_time_start
             storage_time_start = time.time()
@@ -547,10 +561,10 @@ if __name__ == "__main__":
         return args.learning_rate * frac
 
     network = Network(args.channels, args.hiddens)
-    actor = Actor(action_dim=envs.single_action_space.n)
+    actor = Actor(action_dim=envs.single_action_space[0].n)
     critic = Critic()
     network_params = network.init(
-        network_key, np.array([envs.single_observation_space.sample()])
+        network_key, np.array([envs.single_observation_space.sample()[0]])
     )
     agent_state = TrainState.create(
         apply_fn=None,
@@ -940,18 +954,18 @@ if __name__ == "__main__":
                 )
             )
         print(f"model saved to {model_path}")
-        from cleanrl_utils.evals.ppo_envpool_jax_eval import evaluate
+        # from cleanrl_utils.evals.ppo_envpool_jax_eval import evaluate
 
-        episodic_returns = evaluate(
-            model_path,
-            make_env,
-            args.env_id,
-            eval_episodes=10,
-            run_name=f"{run_name}-eval",
-            Model=(Network, Actor, Critic),
-        )
-        for idx, episodic_return in enumerate(episodic_returns):
-            writer.add_scalar("eval/episodic_return", episodic_return, idx)
+        # episodic_returns = evaluate(
+        #     model_path,
+        #     make_env,
+        #     args.env_id,
+        #     eval_episodes=10,
+        #     run_name=f"{run_name}-eval",
+        #     Model=(Network, Actor, Critic),
+        # )
+        # for idx, episodic_return in enumerate(episodic_returns):
+        #     writer.add_scalar("eval/episodic_return", episodic_return, idx)
 
         if args.upload_model:
             from cleanrl_utils.huggingface import push_to_hub
