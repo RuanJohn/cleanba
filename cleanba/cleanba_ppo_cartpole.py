@@ -65,7 +65,7 @@ class Args:
     "total timesteps of the experiments"
     learning_rate: float = 2.5e-4
     "the learning rate of the optimizer"
-    local_num_envs: int = 4
+    local_num_envs: int = 8
     "the number of parallel game environments"
     num_actor_threads: int = 2
     "the number of actor threads to use"
@@ -148,7 +148,6 @@ def make_env(env_id, seed, num_envs):
 
 
 class Network(nn.Module):
-    channels: Sequence[int] = (16, 32, 32)
     hiddens: Sequence[int] = (256,)
 
     @nn.compact
@@ -223,9 +222,7 @@ def rollout(
         key: jax.random.PRNGKey,
     ):
         next_obs = jnp.array(next_obs)
-        hidden = Network(args.channels, args.hiddens).apply(
-            params.network_params, next_obs
-        )
+        hidden = Network(args.hiddens).apply(params.network_params, next_obs)
         logits = Actor(envs.single_action_space.n).apply(params.actor_params, hidden)
         # sample action: Gumbel-softmax trick
         # see https://stats.stackexchange.com/questions/359442/sampling-from-a-categorical-distribution
@@ -519,7 +516,7 @@ if __name__ == "__main__":
         )
         return args.learning_rate * frac
 
-    network = Network(args.channels, args.hiddens)
+    network = Network(args.hiddens)
     actor = Actor(action_dim=envs.single_action_space.n)
     critic = Critic()
     network_params = network.init(
@@ -583,7 +580,7 @@ if __name__ == "__main__":
         params: flax.core.FrozenDict,
         obs: np.ndarray,
     ):
-        hidden = Network(args.channels, args.hiddens).apply(params.network_params, obs)
+        hidden = Network(args.hiddens).apply(params.network_params, obs)
         value = Critic().apply(params.critic_params, hidden).squeeze(-1)
         return value
 
@@ -593,7 +590,7 @@ if __name__ == "__main__":
         obs: np.ndarray,
         actions: np.ndarray,
     ):
-        hidden = Network(args.channels, args.hiddens).apply(params.network_params, obs)
+        hidden = Network(args.hiddens).apply(params.network_params, obs)
         logits = Actor(envs.single_action_space.n).apply(params.actor_params, hidden)
         logprob = jax.nn.log_softmax(logits)[jnp.arange(actions.shape[0]), actions]
         logits = logits - jax.scipy.special.logsumexp(logits, axis=-1, keepdims=True)
@@ -908,6 +905,8 @@ if __name__ == "__main__":
                 )
             )
         print(f"model saved to {model_path}")
+
+        # TODO(Ruan): Need to write a new eval function for non-envpool gym envs.
         # from cleanrl_utils.evals.ppo_envpool_jax_eval import evaluate
 
         # episodic_returns = evaluate(
