@@ -8,7 +8,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from functools import partial
 from types import SimpleNamespace
-from typing import List, NamedTuple, Optional, Sequence, Tuple
+from typing import List, NamedTuple, Optional, Sequence
 
 import envpool
 import flax
@@ -17,7 +17,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import rlax
 import tyro
 from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
@@ -44,7 +43,7 @@ class Args:
     "seed of the experiment"
     track: bool = False
     "if toggled, this experiment will be tracked with Weights and Biases"
-    wandb_project_name: str = "cleanRL"
+    wandb_project_name: str = "test"
     "the wandb's project name"
     wandb_entity: str = None
     "the entity (team) of wandb's project"
@@ -66,7 +65,7 @@ class Args:
     "total timesteps of the experiments"
     learning_rate: float = 2.5e-4
     "the learning rate of the optimizer"
-    local_num_envs: int = 64
+    local_num_envs: int = 4
     "the number of parallel game environments"
     num_actor_threads: int = 2
     "the number of actor threads to use"
@@ -281,8 +280,8 @@ def rollout(
     rollout_time = deque(maxlen=10)
     rollout_queue_put_time = deque(maxlen=10)
     actor_policy_version = 0
-    next_obs = envs.reset()
-    next_done = jnp.zeros(args.local_num_envs, dtype=jax.numpy.bool_)
+    next_obs = envs.reset()  # shape is (num_envs, *obs_shape)
+    next_done = jnp.zeros(args.local_num_envs, dtype=jax.numpy.bool_)  # (num_envs, )
 
     @jax.jit
     def prepare_data(storage: List[Transition]) -> Transition:
@@ -338,8 +337,12 @@ def rollout(
             d2h_time += time.time() - d2h_time_start
 
             env_send_time_start = time.time()
-            next_obs, next_reward, next_done, info = envs.step(cpu_action)
-            env_id = info["env_id"]
+            next_obs, next_reward, next_done, info = envs.step(
+                cpu_action
+            )  # (num_envs, ...) (num_envs, ) (num_envs, )
+            env_id = info[
+                "env_id"
+            ]  # this is (num_envs, ) but it is an array of ints (0, ..., num_envs-1)
             env_send_time += time.time() - env_send_time_start
             storage_time_start = time.time()
 

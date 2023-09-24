@@ -43,7 +43,7 @@ class Args:
     "seed of the experiment"
     track: bool = False
     "if toggled, this experiment will be tracked with Weights and Biases"
-    wandb_project_name: str = "ruan"
+    wandb_project_name: str = "test"
     "the wandb's project name"
     wandb_entity: str = None
     "the entity (team) of wandb's project"
@@ -141,57 +141,10 @@ def make_env(env_id, seed, num_envs):
             [make_env_single(env_id) for i in range(num_envs)]
         )
         envs.num_envs = num_envs
-        envs.single_action_space = envs.action_space
-        envs.single_observation_space = envs.observation_space
         envs.is_vector_env = True
         return envs
 
     return thunk
-
-
-class ResidualBlock(nn.Module):
-    channels: int
-
-    @nn.compact
-    def __call__(self, x):
-        inputs = x
-        x = nn.relu(x)
-        x = nn.Conv(self.channels, kernel_size=(3, 3))(x)
-        x = nn.relu(x)
-        x = nn.Conv(self.channels, kernel_size=(3, 3))(x)
-        return x + inputs
-
-
-class ConvSequence(nn.Module):
-    channels: int
-
-    @nn.compact
-    def __call__(self, x):
-        x = nn.Conv(self.channels, kernel_size=(3, 3))(x)
-        x = nn.max_pool(x, window_shape=(3, 3), strides=(2, 2), padding="SAME")
-        x = ResidualBlock(self.channels)(x)
-        x = ResidualBlock(self.channels)(x)
-        return x
-
-
-# class Network(nn.Module):
-#     channels: Sequence[int] = (16, 32, 32)
-#     hiddens: Sequence[int] = (256,)
-
-#     @nn.compact
-#     def __call__(self, x):
-#         x = jnp.transpose(x, (0, 2, 3, 1))
-#         x = x / (255.0)
-#         for channels in self.channels:
-#             x = ConvSequence(channels)(x)
-#         x = nn.relu(x)
-#         x = x.reshape((x.shape[0], -1))
-#         for hidden in self.hiddens:
-#             x = nn.Dense(
-#                 hidden, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-#             )(x)
-#             x = nn.relu(x)
-#         return x
 
 
 class Network(nn.Module):
@@ -242,7 +195,6 @@ class Transition(NamedTuple):
     rewards: list
     truncations: list
     terminations: list
-    firststeps: list  # first step of an episode
 
 
 def rollout(
@@ -274,7 +226,7 @@ def rollout(
         hidden = Network(args.channels, args.hiddens).apply(
             params.network_params, next_obs
         )
-        logits = Actor(envs.single_action_space[0].n).apply(params.actor_params, hidden)
+        logits = Actor(envs.single_action_space.n).apply(params.actor_params, hidden)
         # sample action: Gumbel-softmax trick
         # see https://stats.stackexchange.com/questions/359442/sampling-from-a-categorical-distribution
         key, subkey = jax.random.split(key)
@@ -353,13 +305,19 @@ def rollout(
             env_send_time_start = time.time()
             next_obs, next_reward, next_done, info = envs.step(cpu_action)
             # TODO (Ruan): Check what envpool puts in info and make suitable wrapper.
-            env_id = info["env_id"]
+            # env_id = info["env_id"]
+            # Hack to make it work like envpool
+            env_id = np.arange(args.local_num_envs)
             env_send_time += time.time() - env_send_time_start
             storage_time_start = time.time()
 
             # info["TimeLimit.truncated"] has a bug https://github.com/sail-sg/envpool/issues/239
             # so we use our own truncated flag
-            truncated = info["elapsed_step"] >= envs.spec.config.max_episode_steps
+
+            # truncated = info["elapsed_step"] >= envs.spec.config.max_episode_steps
+            # Vanilla gym envs don't truncate
+            # Should always be False
+            truncated = np.zeros_like(next_done)
             storage.append(
                 Transition(
                     obs=cached_next_obs,
@@ -370,24 +328,25 @@ def rollout(
                     env_ids=env_id,
                     rewards=next_reward,
                     truncations=truncated,
-                    terminations=info["terminated"],
-                    firststeps=info["elapsed_step"] == 0,
+                    terminations=next_done,
                 )
             )
-            episode_returns[env_id] += info["reward"]
+            episode_returns[
+                env_id
+            ] += next_reward  # Not sure if this should be current previous reward
             returned_episode_returns[env_id] = np.where(
-                info["terminated"] + truncated,
+                next_done + truncated,  # not sure if prev or current done
                 episode_returns[env_id],
                 returned_episode_returns[env_id],
             )
-            episode_returns[env_id] *= (1 - info["terminated"]) * (1 - truncated)
+            episode_returns[env_id] *= (1 - next_done) * (1 - truncated)
             episode_lengths[env_id] += 1
             returned_episode_lengths[env_id] = np.where(
-                info["terminated"] + truncated,
+                next_done + truncated,
                 episode_lengths[env_id],
                 returned_episode_lengths[env_id],
             )
-            episode_lengths[env_id] *= (1 - info["terminated"]) * (1 - truncated)
+            episode_lengths[env_id] *= (1 - next_done) * (1 - truncated)
             storage_time += time.time() - storage_time_start
         rollout_time.append(time.time() - rollout_time_start)
 
@@ -561,10 +520,10 @@ if __name__ == "__main__":
         return args.learning_rate * frac
 
     network = Network(args.channels, args.hiddens)
-    actor = Actor(action_dim=envs.single_action_space[0].n)
+    actor = Actor(action_dim=envs.single_action_space.n)
     critic = Critic()
     network_params = network.init(
-        network_key, np.array([envs.single_observation_space.sample()[0]])
+        network_key, np.array([envs.single_observation_space.sample()])
     )
     agent_state = TrainState.create(
         apply_fn=None,
@@ -680,9 +639,7 @@ if __name__ == "__main__":
         )
         return advantages, advantages + storage.values
 
-    def ppo_loss(
-        params, obs, actions, behavior_logprobs, firststeps, advantages, target_values
-    ):
+    def ppo_loss(params, obs, actions, behavior_logprobs, advantages, target_values):
         newlogprob, entropy, newvalue = get_logprob_entropy_value(params, obs, actions)
         logratio = newlogprob - behavior_logprobs
         ratio = jnp.exp(logratio)
@@ -760,7 +717,6 @@ if __name__ == "__main__":
                     mb_obs,
                     mb_actions,
                     mb_behavior_logprobs,
-                    mb_firststeps,
                     mb_advantages,
                     mb_target_values,
                 ) = minibatch
@@ -772,7 +728,6 @@ if __name__ == "__main__":
                     mb_obs,
                     mb_actions,
                     mb_behavior_logprobs,
-                    mb_firststeps,
                     mb_advantages,
                     mb_target_values,
                 )
@@ -793,7 +748,6 @@ if __name__ == "__main__":
                     shuffled_storage.obs,
                     shuffled_storage.actions,
                     shuffled_storage.logprobs,
-                    shuffled_storage.firststeps,
                     shuffled_advantages,
                     shuffled_target_values,
                 ),
